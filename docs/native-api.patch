@@ -1,0 +1,955 @@
+--- a/UserManagement.UnitTests/Controllers/AccountControllerTests.cs
++++ b/UserManagement.UnitTests/Controllers/AccountControllerTests.cs
+@@ -44,6 +44,59 @@
+         captchaService.Verify(service => service.ValidateAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+     }
+ 
++
++    [Fact]
++    public async Task DeleteAccount_InvalidCsrf_DoesNotCallService()
++    {
++        var service = new Mock<IAccountService>();
++        var controller = CreateDeletionController(service, validCsrf: false);
++
++        var result = Assert.IsType<ObjectResult>(await controller.DeleteAccount(new DeleteAccountRequest { CurrentPassword = "password123" }, CancellationToken.None));
++
++        Assert.Equal(400, result.StatusCode);
++        service.Verify(value => value.DeleteAccountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
++    }
++
++    [Fact]
++    public async Task DeleteAccount_LastAdmin_ReturnsConflictWithoutClearingCookie()
++    {
++        var service = new Mock<IAccountService>();
++        service.Setup(value => value.DeleteAccountAsync("user-id", "password123", It.IsAny<CancellationToken>())).ReturnsAsync(DeleteAccountResult.LastActiveAdmin);
++        var controller = CreateDeletionController(service, validCsrf: true);
++
++        var result = Assert.IsType<ObjectResult>(await controller.DeleteAccount(new DeleteAccountRequest { CurrentPassword = "password123" }, CancellationToken.None));
++
++        Assert.Equal(409, result.StatusCode);
++        Assert.Equal("last_active_admin", Assert.IsType<ProblemDetails>(result.Value).Extensions["code"]);
++        Assert.Equal(0, controller.Response.Headers.SetCookie.Count);
++    }
++
++    [Fact]
++    public async Task DeleteAccount_Success_StillClearsBrowserRefreshCookie()
++    {
++        var service = new Mock<IAccountService>();
++        service.Setup(value => value.DeleteAccountAsync("user-id", "password123", It.IsAny<CancellationToken>())).ReturnsAsync(DeleteAccountResult.Success);
++        var controller = CreateDeletionController(service, validCsrf: true);
++
++        Assert.IsType<NoContentResult>(await controller.DeleteAccount(new DeleteAccountRequest { CurrentPassword = "password123" }, CancellationToken.None));
++        Assert.Contains("refresh_token=", controller.Response.Headers.SetCookie.ToString());
++    }
++
++    private static AccountController CreateDeletionController(Mock<IAccountService> service, bool validCsrf)
++    {
++        var currentUser = new Mock<ICurrentUserService>();
++        currentUser.SetupGet(value => value.UserId).Returns("user-id");
++        var antiforgery = new Mock<IAntiforgery>();
++        if (validCsrf) antiforgery.Setup(value => value.ValidateRequestAsync(It.IsAny<HttpContext>())).Returns(Task.CompletedTask);
++        else antiforgery.Setup(value => value.ValidateRequestAsync(It.IsAny<HttpContext>())).ThrowsAsync(new AntiforgeryValidationException("Invalid token"));
++        var environment = new Mock<IWebHostEnvironment>();
++        environment.SetupGet(value => value.EnvironmentName).Returns(Environments.Development);
++        return new AccountController(service.Object, currentUser.Object, Mock.Of<ICaptchaService>(), antiforgery.Object, Options.Create(new RefreshTokenSettings()), Mock.Of<ILogger<AccountController>>(), environment.Object)
++        {
++            ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() }
++        };
++    }
++
+     private static AccountController CreateController(Mock<IAccountService> accountService, Mock<ICaptchaService> captchaService)
+     {
+         var environment = new Mock<IWebHostEnvironment>();
+--- /dev/null
++++ b/UserManagement.UnitTests/Controllers/MobileAccountControllerTests.cs
+@@ -0,0 +1,60 @@
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Mvc;
++using Moq;
++using UserManagement.Application.Interfaces;
++using UserManagement.Core.DTOs;
++using UserManagement.Web.Controllers;
++
++namespace UserManagement.UnitTests.Controllers;
++
++public sealed class MobileAccountControllerTests
++{
++    [Theory]
++    [InlineData(DeleteAccountResult.Success, 204)]
++    [InlineData(DeleteAccountResult.InvalidPassword, 400)]
++    [InlineData(DeleteAccountResult.LastActiveAdmin, 409)]
++    public async Task DeleteAccount_MapsServiceResultWithoutCookies(DeleteAccountResult outcome, int status)
++    {
++        var service = new Mock<IAccountService>();
++        var current = new Mock<ICurrentUserService>();
++        current.SetupGet(value => value.UserId).Returns("owner-id");
++        service.Setup(value => value.DeleteAccountAsync("owner-id", "password123", It.IsAny<CancellationToken>())).ReturnsAsync(outcome);
++        var controller = new MobileAccountController(service.Object, current.Object)
++        {
++            ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() }
++        };
++        var result = await controller.DeleteAccount(new DeleteAccountRequest { CurrentPassword = "password123" }, CancellationToken.None);
++        Assert.Equal(status, result is StatusCodeResult code ? code.StatusCode : ((ObjectResult)result).StatusCode);
++        Assert.Equal(0, controller.Response.Headers.SetCookie.Count);
++        service.Verify(value => value.DeleteAccountAsync("owner-id", "password123", It.IsAny<CancellationToken>()), Times.Once);
++    }
++
++    [Theory]
++    [InlineData(true, 204)]
++    [InlineData(false, 400)]
++    public async Task ChangePassword_DelegatesToExistingService(bool changed, int status)
++    {
++        var service = new Mock<IAccountService>();
++        var current = new Mock<ICurrentUserService>();
++        current.SetupGet(value => value.UserId).Returns("owner-id");
++        service.Setup(value => value.ChangePasswordAsync("owner-id", "current-password", "new-password", It.IsAny<CancellationToken>())).ReturnsAsync(changed);
++        var controller = new MobileAccountController(service.Object, current.Object)
++        {
++            ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() }
++        };
++        var result = await controller.ChangePassword(new ChangePasswordRequest { CurrentPassword = "current-password", NewPassword = "new-password" }, CancellationToken.None);
++        Assert.Equal(status, result is StatusCodeResult code ? code.StatusCode : ((ObjectResult)result).StatusCode);
++        service.Verify(value => value.ChangePasswordAsync("owner-id", "current-password", "new-password", It.IsAny<CancellationToken>()), Times.Once);
++        Assert.Equal(0, controller.Response.Headers.SetCookie.Count);
++    }
++
++    [Fact]
++    public async Task MissingCurrentUser_DoesNotMutateAccount()
++    {
++        var service = new Mock<IAccountService>();
++        var controller = new MobileAccountController(service.Object, Mock.Of<ICurrentUserService>());
++        Assert.Equal(401, Assert.IsType<ObjectResult>(await controller.DeleteAccount(new DeleteAccountRequest(), CancellationToken.None)).StatusCode);
++        Assert.Equal(401, Assert.IsType<ObjectResult>(await controller.ChangePassword(new ChangePasswordRequest(), CancellationToken.None)).StatusCode);
++        service.VerifyNoOtherCalls();
++    }
++}
+--- /dev/null
++++ b/UserManagement.UnitTests/Controllers/MobileAdminUsersControllerTests.cs
+@@ -0,0 +1,67 @@
++using Microsoft.AspNetCore.Authentication.JwtBearer;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Mvc;
++using Moq;
++using UserManagement.Application.Interfaces;
++using UserManagement.Core.DTOs;
++using UserManagement.Core.Models;
++using UserManagement.Web.Controllers;
++
++namespace UserManagement.UnitTests.Controllers;
++
++public sealed class MobileAdminUsersControllerTests
++{
++    [Fact]
++    public void Controller_RequiresAdminBearer()
++    {
++        var attribute = Assert.Single(typeof(MobileAdminUsersController).GetCustomAttributes(typeof(AuthorizeAttribute), true).Cast<AuthorizeAttribute>());
++        Assert.Equal(UserRoles.Admin, attribute.Roles);
++        Assert.Equal(JwtBearerDefaults.AuthenticationScheme, attribute.AuthenticationSchemes);
++    }
++
++    [Theory]
++    [InlineData("self_role_change")]
++    [InlineData("last_active_admin")]
++    public async Task ChangeRole_PreservesConflictCode(string conflict)
++    {
++        var service = new Mock<IAdminUserService>();
++        var current = new Mock<ICurrentUserService>();
++        current.SetupGet(value => value.UserId).Returns("actor-id");
++        service.Setup(value => value.ChangeRoleAsync("actor-id", "target-id", "User", It.IsAny<CancellationToken>()))
++            .ReturnsAsync(new AdminUserMutationResult { Status = AdminUserMutationStatus.Conflict, ConflictCode = conflict });
++        var controller = CreateController(service.Object, current.Object);
++        var result = Assert.IsType<ObjectResult>(await controller.ChangeRole("target-id", new ChangeUserRoleRequest { Role = "User" }, CancellationToken.None));
++        Assert.Equal(409, result.StatusCode);
++        Assert.Equal(conflict, Assert.IsType<ProblemDetails>(result.Value).Extensions["code"]);
++    }
++
++    [Fact]
++    public async Task ChangeStatus_UsesAuthenticatedActorAndExistingService()
++    {
++        var service = new Mock<IAdminUserService>();
++        var current = new Mock<ICurrentUserService>();
++        current.SetupGet(value => value.UserId).Returns("actor-id");
++        service.Setup(value => value.ChangeStatusAsync("actor-id", "target-id", AccountStatus.Disabled, It.IsAny<CancellationToken>()))
++            .ReturnsAsync(new AdminUserMutationResult { Status = AdminUserMutationStatus.Success });
++        Assert.IsType<NoContentResult>(await CreateController(service.Object, current.Object).ChangeStatus("target-id", new ChangeUserStatusRequest { Status = "Disabled" }, CancellationToken.None));
++        service.Verify(value => value.ChangeStatusAsync("actor-id", "target-id", AccountStatus.Disabled, It.IsAny<CancellationToken>()), Times.Once);
++    }
++
++    [Fact]
++    public async Task Unlock_MissingUser_Returns404()
++    {
++        var service = new Mock<IAdminUserService>();
++        var current = new Mock<ICurrentUserService>();
++        current.SetupGet(value => value.UserId).Returns("actor-id");
++        service.Setup(value => value.UnlockAsync("actor-id", "target-id", It.IsAny<CancellationToken>()))
++            .ReturnsAsync(new AdminUserMutationResult { Status = AdminUserMutationStatus.NotFound });
++        var result = Assert.IsType<ObjectResult>(await CreateController(service.Object, current.Object).Unlock("target-id", CancellationToken.None));
++        Assert.Equal(404, result.StatusCode);
++    }
++
++    private static MobileAdminUsersController CreateController(IAdminUserService service, ICurrentUserService current) => new(service, current)
++    {
++        ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() }
++    };
++}
+--- /dev/null
++++ b/UserManagement.UnitTests/Controllers/MobileAuthControllerTests.cs
+@@ -0,0 +1,361 @@
++using System.IdentityModel.Tokens.Jwt;
++using System.Security.Claims;
++using System.Text;
++using System.Text.Json;
++using Microsoft.AspNetCore.Antiforgery;
++using Microsoft.AspNetCore.Builder;
++using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Logging;
++using Microsoft.IdentityModel.Tokens;
++using UserManagement.Web.Services;
++using System.ComponentModel.DataAnnotations;
++using Microsoft.AspNetCore.Authentication.JwtBearer;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Mvc;
++using Moq;
++using UserManagement.Application.Interfaces;
++using UserManagement.Core.DTOs;
++using UserManagement.Web.Controllers;
++
++namespace UserManagement.UnitTests.Controllers;
++
++public sealed class MobileAuthControllerTests
++{
++    private readonly Mock<IAuthService> _auth = new();
++    private readonly Mock<ICurrentUserService> _current = new();
++
++    private MobileAuthController CreateController() => new(_auth.Object, _current.Object)
++    {
++        ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() }
++    };
++
++    private static AuthSession Session() => new()
++    {
++        AccessToken = new AuthResponse { Token = "test-access", ExpiresAt = DateTime.UtcNow.AddMinutes(10) },
++        RefreshToken = "test-refresh", RefreshTokenExpiresAt = DateTime.UtcNow.AddDays(7), SessionId = new string('a', 32)
++    };
++
++    [Fact]
++    public async Task Signin_ReturnsNativeTokensWithoutSettingCookies()
++    {
++        var session = Session();
++        _auth.Setup(value => value.SigninAsync(It.IsAny<SigninRequest>(), It.IsAny<ClientSessionInfo>(), It.IsAny<CancellationToken>()))
++            .ReturnsAsync(new SigninResult { Status = SigninStatus.Success, Session = session });
++        var controller = CreateController();
++        var result = Assert.IsType<OkObjectResult>(await controller.Signin(new SigninRequest(), CancellationToken.None));
++        var body = Assert.IsType<NativeAuthResponse>(result.Value);
++        Assert.Equal(session.AccessToken.Token, body.AccessToken);
++        Assert.Equal(session.AccessToken.ExpiresAt, body.AccessTokenExpiresAt);
++        Assert.Equal(session.RefreshToken, body.RefreshToken);
++        Assert.Equal(session.RefreshTokenExpiresAt, body.RefreshTokenExpiresAt);
++        Assert.Equal(session.SessionId, body.SessionId);
++        Assert.Equal("no-store", controller.Response.Headers.CacheControl.ToString());
++        Assert.Equal(0, controller.Response.Headers.SetCookie.Count);
++    }
++
++    [Theory]
++    [InlineData(SigninStatus.InvalidCredentials, 401)]
++    [InlineData(SigninStatus.CaptchaRequired, 400)]
++    [InlineData(SigninStatus.EmailVerificationRequired, 403)]
++    [InlineData(SigninStatus.LockedOut, 429)]
++    [InlineData(SigninStatus.AccountDisabled, 403)]
++    public async Task Signin_PreservesBrowserFailureStatuses(SigninStatus status, int expected)
++    {
++        _auth.Setup(value => value.SigninAsync(It.IsAny<SigninRequest>(), It.IsAny<ClientSessionInfo>(), It.IsAny<CancellationToken>()))
++            .ReturnsAsync(new SigninResult { Status = status, CaptchaRequired = true });
++        var result = Assert.IsType<ObjectResult>(await CreateController().Signin(new SigninRequest(), CancellationToken.None));
++        Assert.Equal(expected, result.StatusCode);
++        var problem = Assert.IsType<ProblemDetails>(result.Value);
++        if (status == SigninStatus.CaptchaRequired)
++        {
++            Assert.Equal("captcha_required", problem.Extensions["code"]);
++            Assert.Equal(true, problem.Extensions["captchaRequired"]);
++        }
++        if (status == SigninStatus.InvalidCredentials) Assert.Equal(true, problem.Extensions["captchaRequired"]);
++        if (status == SigninStatus.AccountDisabled) Assert.Equal("account_disabled", problem.Extensions["code"]);
++    }
++
++    [Fact]
++    public async Task Refresh_UsesBodyTokenAndIgnoresCookie()
++    {
++        _auth.Setup(value => value.RefreshAsync("body-token", It.IsAny<ClientSessionInfo>())).ReturnsAsync(Session());
++        var controller = CreateController();
++        controller.Request.Headers.Cookie = "refresh_token=cookie-token";
++        Assert.IsType<OkObjectResult>(await controller.Refresh(new NativeRefreshTokenRequest { RefreshToken = "body-token" }));
++        _auth.Verify(value => value.RefreshAsync("body-token", It.IsAny<ClientSessionInfo>()), Times.Once);
++        Assert.Equal(0, controller.Response.Headers.SetCookie.Count);
++    }
++
++    [Fact]
++    public async Task Refresh_RejectedToken_Returns401WithoutCookieMutation()
++    {
++        var controller = CreateController();
++        var result = Assert.IsType<ObjectResult>(await controller.Refresh(new NativeRefreshTokenRequest { RefreshToken = "rejected" }));
++        Assert.Equal(401, result.StatusCode);
++        Assert.Equal(0, controller.Response.Headers.SetCookie.Count);
++    }
++
++    [Fact]
++    public async Task Signout_RevokesBodyTokenWithoutCookieMutation()
++    {
++        var controller = CreateController();
++        Assert.IsType<NoContentResult>(await controller.Signout(new NativeRefreshTokenRequest { RefreshToken = "body-token" }));
++        _auth.Verify(value => value.SignoutAsync("body-token"), Times.Once);
++        Assert.Equal(0, controller.Response.Headers.SetCookie.Count);
++    }
++
++    [Fact]
++    public async Task SignoutAll_UsesAuthenticatedUserOnly()
++    {
++        _current.SetupGet(value => value.UserId).Returns("owner-id");
++        Assert.IsType<NoContentResult>(await CreateController().SignoutAll());
++        _auth.Verify(value => value.SignoutAllAsync("owner-id"), Times.Once);
++    }
++
++    [Fact]
++    public async Task RevokeSession_PassesOwnerAndCurrentSessionToService()
++    {
++        var sessionId = new string('a', 32);
++        _current.SetupGet(value => value.UserId).Returns("owner-id");
++        _current.SetupGet(value => value.SessionId).Returns(sessionId);
++        _auth.Setup(value => value.RevokeSessionAsync("owner-id", sessionId, sessionId))
++            .ReturnsAsync(new RevokeSessionResult { Revoked = true, RevokedCurrentSession = true });
++        Assert.IsType<OkObjectResult>(await CreateController().RevokeSession(sessionId));
++        _auth.Verify(value => value.RevokeSessionAsync("owner-id", sessionId, sessionId), Times.Once);
++    }
++
++    [Fact]
++    public async Task RevokeSession_UnknownOrOtherOwnersSession_Returns404()
++    {
++        _current.SetupGet(value => value.UserId).Returns("owner-id");
++        _auth.Setup(value => value.RevokeSessionAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>()))
++            .ReturnsAsync(new RevokeSessionResult());
++        Assert.IsType<NotFoundResult>(await CreateController().RevokeSession(new string('a', 32)));
++    }
++
++    [Fact]
++    public async Task RevokeSession_InvalidId_DoesNotCallService()
++    {
++        _current.SetupGet(value => value.UserId).Returns("owner-id");
++        var result = Assert.IsType<ObjectResult>(await CreateController().RevokeSession("invalid"));
++        Assert.Equal(400, result.StatusCode);
++        _auth.Verify(value => value.RevokeSessionAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>()), Times.Never);
++    }
++
++    [Theory]
++    [InlineData("")]
++    [InlineData(" ")]
++    public void TokenRequest_RejectsMissingToken(string token)
++    {
++        var request = new NativeRefreshTokenRequest { RefreshToken = token };
++        Assert.False(Validator.TryValidateObject(request, new ValidationContext(request), [], true));
++    }
++
++    [Fact]
++    public void TokenRequest_RejectsOversizedToken()
++    {
++        var request = new NativeRefreshTokenRequest { RefreshToken = new string('a', 257) };
++        Assert.False(Validator.TryValidateObject(request, new ValidationContext(request), [], true));
++    }
++
++    [Fact]
++    public void Controller_ExplicitlyRequiresBearerAndExemptsOnlyCredentialEndpoints()
++    {
++        var type = typeof(MobileAuthController);
++        var auth = Assert.Single(type.GetCustomAttributes(typeof(AuthorizeAttribute), true).Cast<AuthorizeAttribute>());
++        Assert.Equal(JwtBearerDefaults.AuthenticationScheme, auth.AuthenticationSchemes);
++        foreach (var method in new[] { "Signin", "Refresh", "Signout" })
++            Assert.Single(type.GetMethod(method)!.GetCustomAttributes(typeof(AllowAnonymousAttribute), true));
++        foreach (var method in new[] { "SignoutAll", "RevokeSession" })
++            Assert.Empty(type.GetMethod(method)!.GetCustomAttributes(typeof(AllowAnonymousAttribute), true));
++    }
++}
++
++// Executes real ASP.NET routing, JWT authentication, authorization and MVC model
++// validation in memory. It does not start Program.cs, MongoDB or a network server.
++public sealed class NativeTransportPipelineTests
++{
++    private const string OwnerId = "012345678901234567890123";
++    private const string SessionId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
++    private static readonly SymmetricSecurityKey TestKey = new(new byte[32]);
++
++    [Theory]
++    [InlineData("POST", "/api/mobile/auth/signout-all", null)]
++    [InlineData("DELETE", "/api/mobile/auth/sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null)]
++    [InlineData("POST", "/api/mobile/account/change-password", "{\"currentPassword\":\"password123\",\"newPassword\":\"replacement123\"}")]
++    [InlineData("DELETE", "/api/mobile/account", "{\"currentPassword\":\"password123\"}")]
++    [InlineData("PATCH", "/api/mobile/admin/users/012345678901234567890123/role", "{\"role\":\"User\"}")]
++    [InlineData("PATCH", "/api/mobile/admin/users/012345678901234567890123/status", "{\"status\":\"Disabled\"}")]
++    [InlineData("POST", "/api/mobile/admin/users/012345678901234567890123/unlock", null)]
++    public async Task CookieOnly_CannotAuthorizeNativeMutations(string method, string path, string? body)
++    {
++        await using var fixture = CreatePipeline();
++        var context = await fixture.Send(method, path, body, cookie: "session=browser-token; refresh_token=browser-refresh");
++        Assert.Equal(401, context.Response.StatusCode);
++        fixture.Auth.VerifyNoOtherCalls();
++        fixture.Account.VerifyNoOtherCalls();
++        fixture.Admin.VerifyNoOtherCalls();
++    }
++
++    [Theory]
++    [InlineData("PATCH", "/api/mobile/admin/users/012345678901234567890123/role", "{\"role\":\"User\"}")]
++    [InlineData("PATCH", "/api/mobile/admin/users/012345678901234567890123/status", "{\"status\":\"Disabled\"}")]
++    [InlineData("POST", "/api/mobile/admin/users/012345678901234567890123/unlock", null)]
++    public async Task UserBearer_CannotAccessAdminMutations(string method, string path, string? body)
++    {
++        await using var fixture = CreatePipeline();
++        var context = await fixture.Send(method, path, body, role: "User");
++        Assert.Equal(403, context.Response.StatusCode);
++        fixture.Admin.VerifyNoOtherCalls();
++    }
++
++    [Fact]
++    public async Task AdminBearer_UnlocksWithoutCsrfOrCookie()
++    {
++        await using var fixture = CreatePipeline();
++        fixture.Admin.Setup(value => value.UnlockAsync(OwnerId, OwnerId, It.IsAny<CancellationToken>()))
++            .ReturnsAsync(new AdminUserMutationResult { Status = AdminUserMutationStatus.Success });
++        var context = await fixture.Send("POST", $"/api/mobile/admin/users/{OwnerId}/unlock", role: "Admin");
++        Assert.Equal(204, context.Response.StatusCode);
++        fixture.Admin.Verify(value => value.UnlockAsync(OwnerId, OwnerId, It.IsAny<CancellationToken>()), Times.Once);
++        Assert.Equal(0, context.Response.Headers.SetCookie.Count);
++    }
++
++    [Fact]
++    public async Task UserBearer_RevokesOnlyOwnSession()
++    {
++        await using var fixture = CreatePipeline();
++        fixture.Auth.Setup(value => value.RevokeSessionAsync(OwnerId, SessionId, SessionId))
++            .ReturnsAsync(new RevokeSessionResult { Revoked = true, RevokedCurrentSession = true });
++        var context = await fixture.Send("DELETE", $"/api/mobile/auth/sessions/{SessionId}", role: "User");
++        Assert.Equal(200, context.Response.StatusCode);
++        fixture.Auth.Verify(value => value.RevokeSessionAsync(OwnerId, SessionId, SessionId), Times.Once);
++        context.Response.Body.Position = 0;
++        using var json = await JsonDocument.ParseAsync(context.Response.Body);
++        Assert.True(json.RootElement.GetProperty("revokedCurrentSession").GetBoolean());
++    }
++
++    [Fact]
++    public async Task Refresh_CookieWithoutJsonToken_IsRejectedByModelValidation()
++    {
++        await using var fixture = CreatePipeline();
++        var context = await fixture.Send("POST", "/api/mobile/auth/refresh", "{}", cookie: "refresh_token=cookie-token");
++        Assert.Equal(400, context.Response.StatusCode);
++        fixture.Auth.VerifyNoOtherCalls();
++    }
++
++    [Fact]
++    public async Task NativeSignin_ReturnsCamelCaseTokenContractWithoutCookies()
++    {
++        await using var fixture = CreatePipeline();
++        fixture.Auth.Setup(value => value.SigninAsync(It.IsAny<SigninRequest>(), It.IsAny<ClientSessionInfo>(), It.IsAny<CancellationToken>()))
++            .ReturnsAsync(new SigninResult { Status = SigninStatus.Success, Session = new AuthSession
++            {
++                AccessToken = new AuthResponse { Token = "test-access", ExpiresAt = DateTime.UtcNow.AddMinutes(10) },
++                RefreshToken = "test-refresh", RefreshTokenExpiresAt = DateTime.UtcNow.AddDays(7), SessionId = SessionId
++            }});
++        var context = await fixture.Send("POST", "/api/mobile/auth/signin", "{\"email\":\"user@example.com\",\"password\":\"password123\",\"keepMeSignedIn\":true}");
++        Assert.Equal(200, context.Response.StatusCode);
++        Assert.Contains("no-store", context.Response.Headers.CacheControl.ToString());
++        Assert.Equal(0, context.Response.Headers.SetCookie.Count);
++        context.Response.Body.Position = 0;
++        using var json = await JsonDocument.ParseAsync(context.Response.Body);
++        foreach (var name in new[] { "accessToken", "accessTokenExpiresAt", "refreshToken", "refreshTokenExpiresAt", "sessionId" })
++            Assert.True(json.RootElement.TryGetProperty(name, out _));
++        Assert.False(json.RootElement.TryGetProperty("token", out _));
++    }
++
++    [Theory]
++    [InlineData("POST", "/api/auth/signout-all", null)]
++    [InlineData("POST", "/api/account/change-password", "{\"currentPassword\":\"password123\",\"newPassword\":\"replacement123\"}")]
++    [InlineData("DELETE", "/api/account", "{\"currentPassword\":\"password123\"}")]
++    [InlineData("PATCH", "/api/admin/users/012345678901234567890123/role", "{\"role\":\"User\"}")]
++    public async Task BrowserMutation_StillRequiresCsrfEvenWithMobileHeader(string method, string path, string? body)
++    {
++        await using var fixture = CreatePipeline();
++        var context = await fixture.Send(method, path, body, role: "Admin", mobileHeader: true);
++        Assert.Equal(400, context.Response.StatusCode);
++        fixture.Auth.VerifyNoOtherCalls();
++        fixture.Account.VerifyNoOtherCalls();
++        fixture.Admin.VerifyNoOtherCalls();
++    }
++
++    private static PipelineFixture CreatePipeline()
++    {
++        var builder = WebApplication.CreateEmptyBuilder(new WebApplicationOptions { EnvironmentName = "Testing", ContentRootPath = Path.GetTempPath() });
++        builder.Logging.ClearProviders();
++        builder.Services.AddControllers().AddApplicationPart(typeof(MobileAuthController).Assembly);
++        builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(options =>
++        {
++            options.MapInboundClaims = false;
++            options.TokenValidationParameters = new TokenValidationParameters
++            {
++                ValidateIssuer = true, ValidIssuer = "native-transport-tests",
++                ValidateAudience = true, ValidAudience = "native-transport-tests",
++                ValidateIssuerSigningKey = true, IssuerSigningKey = TestKey,
++                ValidateLifetime = true, ClockSkew = TimeSpan.Zero, RoleClaimType = "role"
++            };
++        });
++        builder.Services.AddAuthorization();
++        builder.Services.AddHttpContextAccessor();
++        builder.Services.AddScoped<ICurrentUserService, CurrentUserService>();
++        var auth = new Mock<IAuthService>();
++        var account = new Mock<IAccountService>();
++        var admin = new Mock<IAdminUserService>();
++        builder.Services.AddSingleton(auth.Object);
++        builder.Services.AddSingleton(account.Object);
++        builder.Services.AddSingleton(admin.Object);
++        builder.Services.AddSingleton(Mock.Of<ICaptchaService>());
++        var csrf = new Mock<IAntiforgery>();
++        csrf.Setup(value => value.ValidateRequestAsync(It.IsAny<HttpContext>())).ThrowsAsync(new AntiforgeryValidationException("Invalid token"));
++        builder.Services.AddSingleton(csrf.Object);
++        var services = builder.Services.BuildServiceProvider();
++        var app = new ApplicationBuilder(services);
++        app.UseRouting();
++        app.UseAuthentication();
++        app.UseAuthorization();
++        app.UseEndpoints(endpoints => endpoints.MapControllers());
++        return new PipelineFixture(services, app.Build(), auth, account, admin);
++    }
++
++    private sealed class PipelineFixture(ServiceProvider services, RequestDelegate pipeline, Mock<IAuthService> auth, Mock<IAccountService> account, Mock<IAdminUserService> admin) : IAsyncDisposable
++    {
++        public Mock<IAuthService> Auth => auth;
++        public Mock<IAccountService> Account => account;
++        public Mock<IAdminUserService> Admin => admin;
++
++        public async Task<HttpContext> Send(string method, string path, string? body = null, string? role = null, string? cookie = null, bool mobileHeader = false)
++        {
++            using var scope = services.CreateScope();
++            var context = new DefaultHttpContext { RequestServices = scope.ServiceProvider };
++            context.Request.Method = method;
++            context.Request.Path = path;
++            context.Request.Scheme = "https";
++            context.Response.Body = new MemoryStream();
++            if (body is not null)
++            {
++                var bytes = Encoding.UTF8.GetBytes(body);
++                context.Request.ContentType = "application/json";
++                context.Request.ContentLength = bytes.Length;
++                context.Request.Body = new MemoryStream(bytes);
++            }
++            if (cookie is not null) context.Request.Headers.Cookie = cookie;
++            if (mobileHeader) context.Request.Headers["X-Client-Type"] = "mobile";
++            if (role is not null)
++            {
++                var jwt = new JwtSecurityToken("native-transport-tests", "native-transport-tests",
++                    [new Claim("sub", OwnerId), new Claim("sid", SessionId), new Claim("role", role)],
++                    expires: DateTime.UtcNow.AddMinutes(5), signingCredentials: new SigningCredentials(TestKey, SecurityAlgorithms.HmacSha256));
++                context.Request.Headers.Authorization = "Bearer " + new JwtSecurityTokenHandler().WriteToken(jwt);
++            }
++            var accessor = services.GetRequiredService<IHttpContextAccessor>();
++            accessor.HttpContext = context;
++            try { await pipeline(context); }
++            finally { accessor.HttpContext = null; }
++            return context;
++        }
++
++        public ValueTask DisposeAsync() => services.DisposeAsync();
++    }
++}
+--- a/UserManagement.UnitTests/Services/AccountServiceTests.cs
++++ b/UserManagement.UnitTests/Services/AccountServiceTests.cs
+@@ -143,7 +143,7 @@
+ 
+         var result = await CreateService().DeleteAccountAsync(user.Id, "wrong-password");
+ 
+-        Assert.False(result);
++        Assert.Equal(DeleteAccountResult.InvalidPassword, result);
+         _fileStorage.Verify(service => service.DeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+         _users.Verify(repository => repository.DeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+     }
+@@ -158,11 +158,42 @@
+ 
+         var result = await CreateService().DeleteAccountAsync(user.Id, "current-password");
+ 
+-        Assert.True(result);
++        Assert.Equal(DeleteAccountResult.Success, result);
+         _fileStorage.Verify(service => service.DeleteAsync(user.ImageUrl, It.IsAny<CancellationToken>()), Times.Once);
+         _accountTokens.Verify(repository => repository.DeleteByUserIdAsync(user.Id, It.IsAny<CancellationToken>()), Times.Once);
+         _refreshTokens.Verify(repository => repository.DeleteByUserIdAsync(user.Id, It.IsAny<CancellationToken>()), Times.Once);
+         _users.Verify(repository => repository.DeleteAsync(user.Id, It.IsAny<CancellationToken>()), Times.Once);
+         _auditEventWriter.Verify(writer => writer.WriteAsync(It.Is<AuditEventRequest>(audit => audit.Module == "Account" && audit.Action == "AccountDeletion" && audit.Outcome == AuditOutcome.Success && audit.ActorUserId == user.Id), It.IsAny<CancellationToken>()), Times.Once);
+     }
++    [Fact]
++    public async Task DeleteAccountAsync_LastActiveAdmin_RejectsBeforeAnyCleanup()
++    {
++        var user = new User { Id = "admin-id", Role = UserRoles.Admin, Status = AccountStatus.Active, PasswordHash = "hash", ImageUrl = "profile.jpg" };
++        _users.Setup(repository => repository.GetByIdAsync(user.Id)).ReturnsAsync(user);
++        _passwordHasher.Setup(hasher => hasher.VerifyHashedPassword(user, user.PasswordHash, "current-password")).Returns(PasswordVerificationResult.Success);
++        _users.Setup(repository => repository.CountActiveAdminsAsync()).ReturnsAsync(1);
++
++        var result = await CreateService().DeleteAccountAsync(user.Id, "current-password");
++
++        Assert.Equal(DeleteAccountResult.LastActiveAdmin, result);
++        _fileStorage.Verify(storage => storage.DeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
++        _accountTokens.Verify(repository => repository.DeleteByUserIdAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
++        _refreshTokens.Verify(repository => repository.DeleteByUserIdAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
++        _users.Verify(repository => repository.DeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
++        _auditEventWriter.Verify(writer => writer.WriteAsync(It.Is<AuditEventRequest>(audit => audit.Action == "AccountDeletion" && audit.Outcome == AuditOutcome.Denied), It.IsAny<CancellationToken>()), Times.Once);
++    }
++
++    [Fact]
++    public async Task DeleteAccountAsync_AdminWithAnotherActiveAdmin_DeletesAccount()
++    {
++        var user = new User { Id = "admin-id", Role = UserRoles.Admin, Status = AccountStatus.Active, PasswordHash = "hash" };
++        _users.Setup(repository => repository.GetByIdAsync(user.Id)).ReturnsAsync(user);
++        _passwordHasher.Setup(hasher => hasher.VerifyHashedPassword(user, user.PasswordHash, "current-password")).Returns(PasswordVerificationResult.Success);
++        _users.Setup(repository => repository.CountActiveAdminsAsync()).ReturnsAsync(2);
++        _users.Setup(repository => repository.DeleteAsync(user.Id, It.IsAny<CancellationToken>())).ReturnsAsync(true);
++
++        Assert.Equal(DeleteAccountResult.Success, await CreateService().DeleteAccountAsync(user.Id, "current-password"));
++        _users.Verify(repository => repository.DeleteAsync(user.Id, It.IsAny<CancellationToken>()), Times.Once);
++    }
++
+ }
+--- a/UserManagement.UnitTests/Services/AuthServiceTests.cs
++++ b/UserManagement.UnitTests/Services/AuthServiceTests.cs
+@@ -197,6 +197,7 @@
+ 
+         Assert.NotNull(result);
+         Assert.Same(expectedResponse, result.AccessToken);
++        Assert.Equal("session-id", result.SessionId);
+         Assert.True(result.KeepMeSignedIn);
+         _refreshTokenRepository.Verify(repository => repository.CreateAsync(It.Is<RefreshToken>(token => token.SessionId == "session-id" && token.SessionCreatedOn == createdOn && token.UserAgent == ClientSession.UserAgent && token.IpAddress == ClientSession.IpAddress)), Times.Once);
+     }
+--- a/src/UserManagement.Application/Interfaces/IAccountService.cs
++++ b/src/UserManagement.Application/Interfaces/IAccountService.cs
+@@ -11,5 +11,5 @@
+     Task<bool> ResetPasswordAsync(string token, string newPassword, CancellationToken cancellationToken = default);
+     Task<bool> ChangePasswordAsync(string userId, string currentPassword, string newPassword, CancellationToken cancellationToken = default);
+     Task<PersonalDataExportDto?> ExportPersonalDataAsync(string userId, CancellationToken cancellationToken = default);
+-    Task<bool> DeleteAccountAsync(string userId, string currentPassword, CancellationToken cancellationToken = default);
++    Task<DeleteAccountResult> DeleteAccountAsync(string userId, string currentPassword, CancellationToken cancellationToken = default);
+ }
+--- a/src/UserManagement.Application/Services/AccountService.cs
++++ b/src/UserManagement.Application/Services/AccountService.cs
+@@ -226,14 +226,22 @@
+         return export;
+     }
+ 
+-    public async Task<bool> DeleteAccountAsync(string userId, string currentPassword, CancellationToken cancellationToken = default)
++    public async Task<DeleteAccountResult> DeleteAccountAsync(string userId, string currentPassword, CancellationToken cancellationToken = default)
+     {
+         var user = await _userRepository.GetByIdAsync(userId);
+ 
+         if (user is null || _passwordHasher.VerifyHashedPassword(user, user.PasswordHash, currentPassword) == PasswordVerificationResult.Failed)
+         {
+             await WriteAuditAsync("AccountDeletion", AuditOutcome.Failure, userId, "User", userId, cancellationToken);
+-            return false;
++            return DeleteAccountResult.InvalidPassword;
++        }
++
++        // Matches the existing admin mutation guard. Count-then-delete is not a
++        // transactional invariant against concurrent administrator changes.
++        if (user.Role == UserRoles.Admin && user.Status == AccountStatus.Active && await _userRepository.CountActiveAdminsAsync() <= 1)
++        {
++            await WriteAuditAsync("AccountDeletion", AuditOutcome.Denied, userId, "User", userId, cancellationToken);
++            return DeleteAccountResult.LastActiveAdmin;
+         }
+ 
+         if (!string.IsNullOrWhiteSpace(user.ImageUrl))
+@@ -251,7 +259,7 @@
+ 
+         _logger.LogInformation("Account deleted for user {UserId}", userId);
+         await WriteAuditAsync("AccountDeletion", AuditOutcome.Success, userId, "User", userId, cancellationToken);
+-        return true;
++        return DeleteAccountResult.Success;
+     }
+ 
+     private async Task SendEmailVerificationAsync(User user, CancellationToken cancellationToken)
+--- a/src/UserManagement.Application/Services/AuthService.cs
++++ b/src/UserManagement.Application/Services/AuthService.cs
+@@ -247,6 +247,7 @@
+ 
+         return new AuthSession
+         {
++            SessionId = sessionId,
+             AccessToken = _tokenService.CreateToken(user, sessionId),
+             RefreshToken = refreshToken,
+             RefreshTokenExpiresAt = expiresAt,
+--- a/src/UserManagement.Core/DTOs/AuthSession.cs
++++ b/src/UserManagement.Core/DTOs/AuthSession.cs
+@@ -2,6 +2,7 @@
+ 
+ public sealed class AuthSession
+ {
++    public string SessionId { get; set; } = string.Empty;
+     public AuthResponse AccessToken { get; set; } = new();
+     public string RefreshToken { get; set; } = string.Empty;
+     public DateTime RefreshTokenExpiresAt { get; set; }
+--- /dev/null
++++ b/src/UserManagement.Core/DTOs/DeleteAccountResult.cs
+@@ -0,0 +1,8 @@
++namespace UserManagement.Core.DTOs;
++
++public enum DeleteAccountResult
++{
++    Success,
++    InvalidPassword,
++    LastActiveAdmin
++}
+--- /dev/null
++++ b/src/UserManagement.Core/DTOs/NativeAuthResponse.cs
+@@ -0,0 +1,10 @@
++namespace UserManagement.Core.DTOs;
++
++public sealed class NativeAuthResponse
++{
++    public string AccessToken { get; init; } = string.Empty;
++    public DateTime AccessTokenExpiresAt { get; init; }
++    public string RefreshToken { get; init; } = string.Empty;
++    public DateTime RefreshTokenExpiresAt { get; init; }
++    public string SessionId { get; init; } = string.Empty;
++}
+--- /dev/null
++++ b/src/UserManagement.Core/DTOs/NativeRefreshTokenRequest.cs
+@@ -0,0 +1,9 @@
++using System.ComponentModel.DataAnnotations;
++
++namespace UserManagement.Core.DTOs;
++
++public sealed class NativeRefreshTokenRequest
++{
++    [Required, StringLength(256)]
++    public string RefreshToken { get; init; } = string.Empty;
++}
+--- a/src/UserManagement.Web/Controllers/AccountController.cs
++++ b/src/UserManagement.Web/Controllers/AccountController.cs
+@@ -147,7 +147,13 @@
+             return Problem(statusCode: StatusCodes.Status401Unauthorized, title: "Unauthenticated", detail: "Please sign in again.");
+         }
+ 
+-        if (!await _accountService.DeleteAccountAsync(_currentUser.UserId, request.CurrentPassword, cancellationToken))
++        var result = await _accountService.DeleteAccountAsync(_currentUser.UserId, request.CurrentPassword, cancellationToken);
++        if (result == DeleteAccountResult.LastActiveAdmin)
++        {
++            return Problem(statusCode: StatusCodes.Status409Conflict, title: "Account deletion rejected", detail: "The final active administrator cannot delete their account.", extensions: new Dictionary<string, object?> { ["code"] = "last_active_admin" });
++        }
++
++        if (result != DeleteAccountResult.Success)
+         {
+             return Problem(statusCode: StatusCodes.Status400BadRequest, title: "Account not deleted", detail: "The current password is incorrect.");
+         }
+--- /dev/null
++++ b/src/UserManagement.Web/Controllers/MobileAccountController.cs
+@@ -0,0 +1,42 @@
++using Microsoft.AspNetCore.Authentication.JwtBearer;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.AspNetCore.RateLimiting;
++using UserManagement.Application.Interfaces;
++using UserManagement.Core.DTOs;
++
++namespace UserManagement.Web.Controllers;
++
++[ApiController]
++[Route("api/mobile/account")]
++[Authorize(AuthenticationSchemes = JwtBearerDefaults.AuthenticationScheme)]
++public sealed class MobileAccountController(IAccountService accountService, ICurrentUserService currentUser) : ControllerBase
++{
++    [HttpPost("change-password")]
++    public async Task<IActionResult> ChangePassword(ChangePasswordRequest request, CancellationToken cancellationToken)
++    {
++        if (string.IsNullOrWhiteSpace(currentUser.UserId)) return UnauthorizedProblem();
++        if (!await accountService.ChangePasswordAsync(currentUser.UserId, request.CurrentPassword, request.NewPassword, cancellationToken))
++        {
++            return Problem(statusCode: StatusCodes.Status400BadRequest, title: "Password not changed", detail: "The current password is incorrect or the new password matches it.");
++        }
++        return NoContent();
++    }
++
++    [HttpDelete]
++    [EnableRateLimiting("Auth")]
++    public async Task<IActionResult> DeleteAccount(DeleteAccountRequest request, CancellationToken cancellationToken)
++    {
++        if (string.IsNullOrWhiteSpace(currentUser.UserId)) return UnauthorizedProblem();
++        var result = await accountService.DeleteAccountAsync(currentUser.UserId, request.CurrentPassword, cancellationToken);
++        return result switch
++        {
++            DeleteAccountResult.Success => NoContent(),
++            DeleteAccountResult.InvalidPassword => Problem(statusCode: StatusCodes.Status400BadRequest, title: "Account not deleted", detail: "The current password is incorrect."),
++            DeleteAccountResult.LastActiveAdmin => Problem(statusCode: StatusCodes.Status409Conflict, title: "Account deletion rejected", detail: "The final active administrator cannot delete their account.", extensions: new Dictionary<string, object?> { ["code"] = "last_active_admin" }),
++            _ => throw new InvalidOperationException("Unknown account deletion result.")
++        };
++    }
++
++    private ObjectResult UnauthorizedProblem() => Problem(statusCode: StatusCodes.Status401Unauthorized, title: "Unauthenticated", detail: "Please sign in again.");
++}
+--- /dev/null
++++ b/src/UserManagement.Web/Controllers/MobileAdminUsersController.cs
+@@ -0,0 +1,64 @@
++using Microsoft.AspNetCore.Authentication.JwtBearer;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Mvc;
++using UserManagement.Application.Interfaces;
++using UserManagement.Core.DTOs;
++using UserManagement.Core.Models;
++using UserManagement.Web.Validation;
++
++namespace UserManagement.Web.Controllers;
++
++[ApiController]
++[Authorize(AuthenticationSchemes = JwtBearerDefaults.AuthenticationScheme, Roles = UserRoles.Admin)]
++[Route("api/mobile/admin/users")]
++public sealed class MobileAdminUsersController(IAdminUserService adminUserService, ICurrentUserService currentUser) : ControllerBase
++{
++    [HttpPatch("{id}/role")]
++    public async Task<IActionResult> ChangeRole([MongoObjectId] string id, ChangeUserRoleRequest request, CancellationToken cancellationToken)
++    {
++        if (string.IsNullOrWhiteSpace(currentUser.UserId)) return UnauthorizedProblem();
++
++        var result = await adminUserService.ChangeRoleAsync(currentUser.UserId, id, request.Role, cancellationToken);
++        return ToActionResult(result);
++    }
++
++    [HttpPatch("{id}/status")]
++    public async Task<IActionResult> ChangeStatus([MongoObjectId] string id, ChangeUserStatusRequest request, CancellationToken cancellationToken)
++    {
++        if (string.IsNullOrWhiteSpace(currentUser.UserId)) return UnauthorizedProblem();
++
++        var status = Enum.Parse<AccountStatus>(request.Status, ignoreCase: false);
++        var result = await adminUserService.ChangeStatusAsync(currentUser.UserId, id, status, cancellationToken);
++        return ToActionResult(result);
++    }
++
++    [HttpPost("{id}/unlock")]
++    public async Task<IActionResult> Unlock([MongoObjectId] string id, CancellationToken cancellationToken)
++    {
++        if (string.IsNullOrWhiteSpace(currentUser.UserId)) return UnauthorizedProblem();
++
++        var result = await adminUserService.UnlockAsync(currentUser.UserId, id, cancellationToken);
++        return ToActionResult(result);
++    }
++
++    private IActionResult ToActionResult(AdminUserMutationResult result)
++    {
++        return result.Status switch
++        {
++            AdminUserMutationStatus.Success => NoContent(),
++            AdminUserMutationStatus.NotFound => Problem(statusCode: StatusCodes.Status404NotFound, title: "User not found", detail: "The requested user does not exist."),
++            AdminUserMutationStatus.Conflict => Problem(statusCode: StatusCodes.Status409Conflict, title: "User update rejected", detail: GetConflictMessage(result.ConflictCode), extensions: new Dictionary<string, object?> { ["code"] = result.ConflictCode }),
++            _ => throw new InvalidOperationException("Unknown admin user mutation result.")
++        };
++    }
++
++    private ObjectResult UnauthorizedProblem() => Problem(statusCode: StatusCodes.Status401Unauthorized, title: "Unauthenticated", detail: "Please sign in again.");
++
++    private static string GetConflictMessage(string? code) => code switch
++    {
++        "self_disable" => "You cannot disable your own account.",
++        "self_role_change" => "You cannot change your own role.",
++        "last_active_admin" => "The final active administrator cannot be disabled or demoted.",
++        _ => "The requested user update conflicts with the current account state."
++    };
++}
+--- /dev/null
++++ b/src/UserManagement.Web/Controllers/MobileAuthController.cs
+@@ -0,0 +1,98 @@
++using Microsoft.AspNetCore.Authentication.JwtBearer;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.AspNetCore.RateLimiting;
++using UserManagement.Application.Interfaces;
++using UserManagement.Core.DTOs;
++
++namespace UserManagement.Web.Controllers;
++
++[ApiController]
++[Route("api/mobile/auth")]
++[Authorize(AuthenticationSchemes = JwtBearerDefaults.AuthenticationScheme)]
++[ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
++public sealed class MobileAuthController(IAuthService authService, ICurrentUserService currentUser) : ControllerBase
++{
++    [AllowAnonymous]
++    [HttpPost("signin")]
++    [EnableRateLimiting("Auth")]
++    public async Task<IActionResult> Signin(SigninRequest request, CancellationToken cancellationToken)
++    {
++        var result = await authService.SigninAsync(request, CreateClientSessionInfo(), cancellationToken);
++        return result.Status switch
++        {
++            SigninStatus.Success => TokenResponse(result.Session ?? throw new InvalidOperationException("Successful sign-in did not create a session.")),
++            SigninStatus.InvalidCredentials => Problem(statusCode: StatusCodes.Status401Unauthorized, title: "Invalid credentials", detail: "Invalid email or password.", extensions: new Dictionary<string, object?> { ["code"] = "invalid_credentials", ["captchaRequired"] = result.CaptchaRequired }),
++            SigninStatus.CaptchaRequired => Problem(statusCode: StatusCodes.Status400BadRequest, title: "Human verification failed", detail: "Complete the human verification and try again.", extensions: new Dictionary<string, object?> { ["code"] = "captcha_required", ["captchaRequired"] = true }),
++            SigninStatus.EmailVerificationRequired => Problem(statusCode: StatusCodes.Status403Forbidden, title: "Email verification required", detail: "Verify your email before signing in."),
++            SigninStatus.LockedOut => Problem(statusCode: StatusCodes.Status429TooManyRequests, title: "Account temporarily locked", detail: "Too many failed sign-in attempts. Try again later."),
++            SigninStatus.AccountDisabled => Problem(statusCode: StatusCodes.Status403Forbidden, title: "Account unavailable", detail: "This account is unavailable. Contact an administrator.", extensions: new Dictionary<string, object?> { ["code"] = "account_disabled" }),
++            _ => throw new InvalidOperationException("Unknown sign-in result.")
++        };
++    }
++
++    [AllowAnonymous]
++    [HttpPost("refresh")]
++    [EnableRateLimiting("Auth")]
++    public async Task<IActionResult> Refresh(NativeRefreshTokenRequest request)
++    {
++        var session = await authService.RefreshAsync(request.RefreshToken, CreateClientSessionInfo());
++        return session is null
++            ? Problem(statusCode: StatusCodes.Status401Unauthorized, title: "Session expired", detail: "Please sign in again.")
++            : TokenResponse(session);
++    }
++
++    [AllowAnonymous]
++    [HttpPost("signout")]
++    public async Task<IActionResult> Signout(NativeRefreshTokenRequest request)
++    {
++        await authService.SignoutAsync(request.RefreshToken);
++        return NoContent();
++    }
++
++    [HttpPost("signout-all")]
++    public async Task<IActionResult> SignoutAll()
++    {
++        if (string.IsNullOrWhiteSpace(currentUser.UserId)) return UnauthorizedProblem();
++        await authService.SignoutAllAsync(currentUser.UserId);
++        return NoContent();
++    }
++
++    [HttpDelete("sessions/{sessionId}")]
++    public async Task<IActionResult> RevokeSession(string sessionId)
++    {
++        if (string.IsNullOrWhiteSpace(currentUser.UserId)) return UnauthorizedProblem();
++        if (!Guid.TryParseExact(sessionId, "N", out _))
++        {
++            return Problem(statusCode: StatusCodes.Status400BadRequest, title: "Invalid session", detail: "The session identifier is invalid.");
++        }
++
++        var result = await authService.RevokeSessionAsync(currentUser.UserId, sessionId, currentUser.SessionId);
++        return result.Revoked ? Ok(new { result.RevokedCurrentSession }) : NotFound();
++    }
++
++    private OkObjectResult TokenResponse(AuthSession session)
++    {
++        Response.Headers.CacheControl = "no-store";
++        return Ok(new NativeAuthResponse
++        {
++            AccessToken = session.AccessToken.Token,
++            AccessTokenExpiresAt = session.AccessToken.ExpiresAt,
++            RefreshToken = session.RefreshToken,
++            RefreshTokenExpiresAt = session.RefreshTokenExpiresAt,
++            SessionId = session.SessionId
++        });
++    }
++
++    private ClientSessionInfo CreateClientSessionInfo()
++    {
++        var userAgent = Request.Headers.UserAgent.ToString();
++        return new ClientSessionInfo
++        {
++            UserAgent = string.IsNullOrWhiteSpace(userAgent) ? "Unknown device" : userAgent[..Math.Min(userAgent.Length, 512)],
++            IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "Unknown"
++        };
++    }
++
++    private ObjectResult UnauthorizedProblem() => Problem(statusCode: StatusCodes.Status401Unauthorized, title: "Unauthenticated", detail: "Please sign in again.");
++}
