@@ -53,9 +53,27 @@ class _AdminUsersPageState extends State<AdminUsersPage> {
     }
   }
 
+  Future<void> signOut() async {
+    setState(() => _busy = true);
+    try {
+      await widget.services.session.signOut();
+    } catch (error) {
+      if (mounted) showMessage(context, safeError(error));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) => ContentPage(
     title: 'User management',
+    actions: [
+      IconButton(
+        tooltip: 'Log out',
+        onPressed: _busy ? null : signOut,
+        icon: const Icon(Icons.logout),
+      ),
+    ],
     children: [
       if (_busy) const LinearProgressIndicator(),
       RemoteContent<PagedItems>(
