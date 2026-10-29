@@ -326,7 +326,7 @@ class _AuthPageState extends State<AuthPage> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           field('Email', _email, emailText, email: true),
-          field('Password', _password, passwordText, secret: true),
+          field('Password', _password, requiredText, secret: true),
           const Text(
             'Your session stays signed in on this device until it expires or you sign out.',
           ),

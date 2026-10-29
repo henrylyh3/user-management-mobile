@@ -113,6 +113,30 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets(
+    'Sign-in accepts short existing passwords while signup rejects them',
+    (tester) async {
+      await pumpAuth(tester);
+      final signInPassword = find.byType(TextFormField).at(1);
+      await tester.enterText(signInPassword, 'user');
+      expect(
+        tester.state<FormFieldState<String>>(signInPassword).validate(),
+        isTrue,
+      );
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(const SizedBox.shrink());
+      await pumpAuth(tester, mode: AuthMode.signUp);
+      final signUpPassword = find.byType(TextFormField).at(3);
+      await tester.enterText(signUpPassword, 'user');
+      expect(
+        tester.state<FormFieldState<String>>(signUpPassword).validate(),
+        isFalse,
+      );
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('Other authentication modes retain the shared screen', (
     tester,
   ) async {
